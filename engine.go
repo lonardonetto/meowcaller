@@ -1013,6 +1013,24 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
 		if en := findChild(ack, "error"); en != nil {
 			callID = en.AttrGetter().String("call-id")
 		}
+		// Fallback: the server's error ack may not carry call-id on the <error>
+		// child (e.g. 463 misdial / 403 forbidden). Without a call-id, finishCall
+		// is a no-op and the call stays "ringing" forever, blocking the caller's
+		// worker. Try the ack attributes, then any active call on this instance.
+		if callID == "" {
+			callID = ack.AttrGetter().String("call-id")
+		}
+		if callID == "" {
+			callID = ack.AttrGetter().String("id")
+		}
+		if callID == "" {
+			e.mu.Lock()
+			for id := range e.calls {
+				callID = id
+				break
+			}
+			e.mu.Unlock()
+		}
 		e.c.log.Warn().Str("call_id", callID).Str("error_code", errCode).Msg("call rejected by server")
 		e.finishCall(callID, "server:"+errCode)
 		return
