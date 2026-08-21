@@ -50,6 +50,8 @@ type engineCall struct {
 	selfLID string
 	peerLID string
 
+	stanzaID string // <call> stanza id (message id) — echoed back by the server's <ack>
+
 	creator types.JID // call-creator JID (for accept/relaylatency)
 	from    types.JID // the <call> "from" — where stanzas are addressed
 
@@ -468,7 +470,8 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 	})
 	// The builder leaves the <call> stanza id to the I/O layer; without it the server
 	// can't route/ack the offer, so it never reaches the callee.
-	offer.Attrs["id"] = cli.GenerateMessageID()
+	stanzaID := cli.GenerateMessageID()
+	offer.Attrs["id"] = stanzaID
 
 	call := &Call{eng: e, id: callID, peer: peerLID, phase: CallPhaseCalling}
 
@@ -476,6 +479,7 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 	m := e.entry(callID)
 	m.call = call
 	m.callKey = callKey[:]
+	m.stanzaID = stanzaID
 	m.selfLID = self.String()
 	m.peerLID = peerLID.String()
 	m.creator = self
@@ -1009,27 +1013,26 @@ func (e *engine) applyVoipSettingsCodec(m *engineCall, node *waBinary.Node, call
 // caller bring up media. An error ack tears the call down.
 func (e *engine) onCallAck(ack *waBinary.Node) {
 	if errCode := ack.AttrGetter().String("error"); errCode != "" {
+		// The server's error <ack class="call" error="463|403"> echoes the stanza
+		// <call> id back as its own "id" attribute; it does NOT repeat the inner
+		// call-id (that lives on the <offer> child of the original stanza). Resolve
+		// the call-id in order of reliability:
+		//   1. <error call-id="..."> child (when present)
+		//   2. ack "call-id" attribute (when present)
+		//   3. ack "id" attribute → engineCall.stanzaID (the reliable correlation)
+		//   4. single active call (unambiguous) — never a random pick
 		callID := ""
 		if en := findChild(ack, "error"); en != nil {
 			callID = en.AttrGetter().String("call-id")
 		}
-		// Fallback: the server's error ack may not carry call-id on the <error>
-		// child (e.g. 463 misdial / 403 forbidden). Without a call-id, finishCall
-		// is a no-op and the call stays "ringing" forever, blocking the caller's
-		// worker. Try the ack attributes, then any active call on this instance.
 		if callID == "" {
 			callID = ack.AttrGetter().String("call-id")
 		}
 		if callID == "" {
-			callID = ack.AttrGetter().String("id")
+			callID = e.callIDByStanza(ack.AttrGetter().String("id"))
 		}
 		if callID == "" {
-			e.mu.Lock()
-			for id := range e.calls {
-				callID = id
-				break
-			}
-			e.mu.Unlock()
+			callID = e.onlyActiveCallID()
 		}
 		e.c.log.Warn().Str("call_id", callID).Str("error_code", errCode).Msg("call rejected by server")
 		e.finishCall(callID, "server:"+errCode)
@@ -1060,6 +1063,38 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
 	}
 	e.mu.Unlock()
 	e.onRelay(callID, ack)
+}
+
+// callIDByStanza resolves a call-id from the <call> stanza id echoed by the server's
+// <ack class="call">. The server ack's "id" attribute repeats the original stanza id,
+// which placeCall records on the engineCall.
+func (e *engine) callIDByStanza(stanzaID string) string {
+	if stanzaID == "" {
+		return ""
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for id, m := range e.calls {
+		if m != nil && m.stanzaID == stanzaID {
+			return id
+		}
+	}
+	return ""
+}
+
+// onlyActiveCallID returns the call-id only when there is exactly one active call,
+// so the error ack is unambiguous. With zero or multiple calls it returns "" (a
+// random pick would risk ending the wrong call).
+func (e *engine) onlyActiveCallID() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.calls) != 1 {
+		return ""
+	}
+	for id := range e.calls {
+		return id
+	}
+	return ""
 }
 
 // onCallRaw sees every raw <call> node before whatsmeow processes it. It fires the
